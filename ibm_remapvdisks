@@ -1,0 +1,159 @@
+#!/usr/bin/python2.7
+#
+# Description: List mappings, remove them and make them again with
+#              fixed SCSI IDs
+# Author:      Christophe Drevet-Droguet
+
+import sys
+from subprocess import check_output, Popen, PIPE
+import re
+
+
+# Parsing arguments
+import argparse
+parser = argparse.ArgumentParser(description='List mappings, remove them and make them again with fixed SCSI IDs')
+parser.add_argument('device', metavar='DEVICE',
+               help='Hostname of the storage cluster')
+parser.add_argument('--version', action='version', version='%(prog)s 0.5')
+parser.add_argument('host', metavar='HOST',
+               help='name of the host to remap')
+actiongrp = parser.add_mutually_exclusive_group(required=False)
+actiongrp.add_argument('--clean', default=False, action='store_true',
+               help='remove all mappings')
+actiongrp.add_argument('--file',
+               help='map volumes from file list')
+actiongrp.add_argument('--clone', default=False,
+               help='map volumes mapped to another host')
+parser.add_argument('--like', default=False,
+               help='name of the host to get SCSI IDs from')
+parser.add_argument('--action', default=False, action='store_true',
+               help='do the stuff')
+parser.add_argument('-v', '--verbose', default=False, action='store_true',
+               help='print verbose output')
+args = parser.parse_args()
+
+# Check parameters
+if args.clean:
+    print("Remove vdisks mappings on " + str(args.device))
+else:
+    print("Remap vdisks on " + str(args.device))
+if args.host != '.*':
+    print("  with host patterns: " + str(args.host))
+if args.clone:
+    print("  taking mappings info on " + str(args.clone))
+if args.action:
+    ACTION = ''
+else:
+    ACTION = 'TEST MODE, NO ACTION DONE: '
+
+def open_ssh():
+    controlpath = "-oControlPath=~/.ssh/ssh-%r-%h-%p"
+    if args.verbose:
+        print("INFO: opening SSH control session")
+    return Popen(['ssh', '-T', '-oControlMaster=yes', controlpath, args.device], stdin=PIPE, stdout=None, stderr=None)
+
+def close_ssh(sshproc):
+    controlpath = "-oControlPath=~/.ssh/ssh-%r-%h-%p"
+    if args.verbose:
+        print("INFO: closing SSH control session")
+    return sshproc.communicate("exit\n")
+
+def cmd_ssh(cmd):
+    controlpath = "-oControlPath=~/.ssh/ssh-%r-%h-%p"
+    command = ["ssh", '-oControlMaster=no' , controlpath, args.device]
+    command.extend(cmd)
+    if args.verbose:
+        print("INFO: running command '{}'".format(' '.join(cmd)))
+    return check_output(command)
+
+# Open SSH connection
+sshproc = open_ssh()
+
+# Get mappings
+output = cmd_ssh(["lshostvdiskmap", "-nohdr", "-delim", ":", args.host])
+mappings = []
+fields = ['host_id', 'host_name', 'scsi_id', 'vdisk_id', 'vdisk_name', 'vdisk_uid', 'io_group_id', 'io_group_name']
+for line in output.split():
+    mapping = dict(zip(fields, line.split(':')))
+    mappings.append(mapping)
+unmappings = mappings
+if args.file:
+    mappings = []
+    with open(args.file) as f:
+        for line in f:
+            line = line.split()[0]
+            mappings.append({'vdisk_id': line, 'vdisk_name': line})
+if args.clone:
+    output = cmd_ssh(["lshostvdiskmap", "-nohdr", "-delim", ":", args.clone])
+    mappings = []
+    fields = ['host_id', 'host_name', 'scsi_id', 'vdisk_id', 'vdisk_name', 'vdisk_uid', 'io_group_id', 'io_group_name']
+    for line in output.split():
+        mapping = dict(zip(fields, line.split(':')))
+        mappings.append(mapping)
+
+if args.like:
+    output = cmd_ssh(["lshostvdiskmap", "-nohdr", "-delim", ":", args.like])
+    likemaps = {}
+    fields = ['host_id', 'host_name', 'scsi_id', 'vdisk_id', 'vdisk_name', 'vdisk_uid', 'io_group_id', 'io_group_name']
+    for line in output.split():
+        mapping = dict(zip(fields, line.split(':')))
+        if mapping['vdisk_id'] not in likemaps:
+            likemaps.update({mapping['vdisk_id']: mapping['scsi_id']})
+
+done = []
+for mapping in unmappings:
+    if mapping['vdisk_id'] not in done:
+
+        # Unmap vDisk
+        print('{}Unmapping vdisk {} from {}'.format(ACTION, mapping['vdisk_name'], args.host))
+        command = ["rmvdiskhostmap", "-host", args.host, mapping['vdisk_id']]
+        if args.verbose:
+            print('INFO: Execute command: {}'.format(' '.join(command)))
+        if args.action:
+            output = cmd_ssh(command)
+        else:
+            output = 'No action done'
+        if args.verbose:
+            print('rmvdiskhostmap output: ' + output)
+        done.append(mapping['vdisk_id'])
+
+if args.clean:
+    close_ssh(sshproc)
+    sys.exit(0)
+
+done = []
+scsiid = 0
+for mapping in mappings:
+    if mapping['vdisk_id'] not in done:
+
+        # Get SCSI ID
+        if args.like:
+            if mapping['vdisk_id'] in likemaps:
+                scsiid = likemaps[mapping['vdisk_id']]
+            else:
+                print('WARNING: vdisk {} not present in reference {}, not mapping.'.format(mapping['vdisk_name'], args.like))
+                scsiid =  False
+
+        if args.clone:
+            scsiid = mapping['scsi_id']
+
+        # Map vDisk with new SCSI ID
+        if scsiid is not False:
+            print('{}Mapping vdisk {} with SCSI ID {} on {}'.format(ACTION, mapping['vdisk_name'], scsiid, args.host))
+            command = ["mkvdiskhostmap", "-force", "-host", args.host, "-scsi", str(scsiid), mapping['vdisk_id']]
+            if args.verbose:
+                print('INFO: Execute command: {}'.format(' '.join(command)))
+            if args.action:
+                output = cmd_ssh(command)
+            else:
+                output = 'No action done'
+            if args.verbose:
+                print('mkvdiskhostmap output: ' + output)
+        done.append(mapping['vdisk_id'])
+
+        # Increment SCSI ID
+        if not args.like and not args.clone:
+            scsiid += 1
+
+# Close SSH connection
+close_ssh(sshproc)

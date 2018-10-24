@@ -1,0 +1,145 @@
+#!/bin/bash
+#
+# Description: vDisk - Host mapping
+# Author:      Christophe Drevet-Droguet
+
+typeset PROG="$(basename "$0")"
+typeset VERSION="0.6"
+
+function usage {
+    if [ "$#" != "0" ]; then
+        echo "ERROR: $@"
+        echo ""
+    fi
+    echo "${PROG} version ${VERSION}"
+    echo "usage: ${PROG} [-h] [-n] DEVICE HOSTS_PATTERN VDISK_PATTERN [SCSI_ID ...]"
+    echo ""
+    echo "  OPTIONS:"
+    echo "    -h|--help:     this usage page"
+    echo "    -n|--noaction: no action, just show what would be done."
+    echo ""
+    echo "  PARAMETERS:"
+    echo "    DEVICE:        Hostname of the storage cluster"
+    echo "    HOSTS_PATTERN: Regular expression to select hosts to map (used"
+    echo "                   with 'grep -P' and '=~' bash operator)"
+    echo "    VDISK_PATTERN: Regular expression to select vdisks to map or"
+    echo "                   a file containing a vdisks list"
+    echo "    SCSI_ID:       Force the use of this SCSI ID. There must be"
+    echo "                   an ID for each selected vdisk. If there is not"
+    echo "                   enough IDs, the default policy is used: last + 1"
+    exit 2
+}
+
+typeset _host
+typeset _dev=
+typeset _hosts=
+typeset _vdisk_pattern=
+typeset _vdisk_file=
+typeset _noaction=0
+typeset _xhostid=0
+typeset -a _scsiids
+typeset -i i
+typeset -i imax=$#
+
+for (( i=0; i<${imax}; i++ )); do
+    if [ "$1" = "-n" ]; then
+        _noaction=1
+    elif [ "$1" = "-h" -o "$1" = "--help" ]; then
+        usage
+    elif [ -z "${_dev}" ]; then
+        _dev="$1"
+    elif [ -z "${_hosts}" ]; then
+        _hosts="$1"
+    elif [ -z "${_vdisk_pattern}" ]; then
+        _vdisk_pattern="$1"
+    else
+        _scsiids[${#_scsiids[@]}]="$1"
+    fi
+    shift
+done
+
+if [ -f "${_vdisk_pattern}" ]; then
+    _vdisk_file="${_vdisk_pattern}"
+    _vdisk_pattern=
+    while read _vdisk; do
+        [ -z "${_vdisk_pattern}" ] && _vdisk_pattern="(" \
+                                   || _vdisk_pattern="${_vdisk_pattern}|"
+        _vdisk_pattern="${_vdisk_pattern}${_vdisk}"
+    done < "${_vdisk_file}"
+    [ -n "${_vdisk_pattern}" ] && _vdisk_pattern="${_vdisk_pattern})"
+fi
+
+[ -z "${_vdisk_pattern}" -a -n "${_vdisk_file}" ] && usage "File list empty or unreadable"
+[ -z "${_dev}" -o -z "${_hosts}" -o -z "${_vdisk_pattern}" ] && usage
+
+function map_vdisk_to_host {
+    local _f1 _f2 _id _f3 _f4 _vname _f6
+    local _maxid=0
+    local _vdiskok=0
+    local _vdisk="$1"
+    local _scsiid="$2"
+    local _vdiskcount="$3"
+    local _error=0
+
+    # Check SCSI ID in use, and get the next available
+    while read _f1 _f2_host _id _f4 _vname _f6; do
+        [ "${_f1}" = "id" ] && continue
+        [[ "${_f2_host}" =~ ${_hosts} ]] || continue
+        if [ -z "${_scsiid}" -a "${_vname}" = "${_vdisk}" ]; then
+            _scsiid="${_id}"
+        fi
+        if [ "${_id}" = "${_scsiid}" -a "${_vname}" != "${_vdisk}" ]; then
+            echo "ERROR: SCSI ID already in use: ${_scsiid} for ${_vname} on host ${_f2_host}"
+            _error=1
+        fi
+        [ "${_id}" -ge "${_maxid}" ] && _maxid=$((_id + 1))
+    done < <(ssh -n "${_dev}" lshostvdiskmap)
+    [ "${_error}" != "0" ] && exit 1
+
+    # Check vDisk existence
+    while read _f1 _vname _f3; do
+        [ "${_vname}" = "${_vdisk}" ] && _vdiskok=1
+    done < <(ssh -n "${_dev}" lsvdisk)
+
+    if [ "${_vdiskok}" != "1" ]; then
+        echo "ERROR: inexistent vDisk '${_vdisk}'"
+        exit 1
+    fi
+
+    if [ -z "${_scsiid}" ]; then
+        _scsiid=${_maxid}
+        [ "${_noaction}" = "0" ] || _scsiid=$((${_scsiid} + ${_vdiskcount}))
+    fi
+    echo "INFO: Using ${_scsiid} as SCSI ID for ${_vdisk}"
+
+    while read _host; do
+        echo -n "${_host}: "
+        if [ "${_noaction}" = "0" ]; then
+            ssh -n "${_dev}" mkvdiskhostmap -force -host ${_host} -scsi ${_scsiid} ${_vdisk}
+        else
+            echo "Would map vdisk '${_vdisk}' to host '${_host}' with id '${_scsiid}'"
+        fi
+    done < <(ssh "${_dev}" lshost -delim : | cut -d: -f2 | grep -P "${_hosts}")
+}
+
+typeset -a _vdisks
+i=0
+while read _vdisk; do
+    _vdisks[$i]="${_vdisk}"
+    i=i+1
+done < <(ssh -n "${_dev}" lsvdisk -delim : | cut -d: -f2 | grep -P "${_vdisk_pattern}")
+
+if [ "${#_vdisks[@]}" = "0" ]; then
+    echo "ERROR: no vDisk found with this pattern: ${_vdisk_pattern}"
+    exit 1
+fi
+
+i=0
+for _vdisk in "${_vdisks[@]}"; do
+    if [ -z "${_scsiids[$i]}" ]; then
+        map_vdisk_to_host "${_vdisk}" "" $i
+    else
+        map_vdisk_to_host "${_vdisk}" "${_scsiids[$i]}"
+    fi
+    i=i+1
+done
